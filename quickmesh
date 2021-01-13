@@ -1,0 +1,249 @@
+#!/usr/bin/python3
+
+#NOTE python3 is not optional but a hard requirement
+
+#Checking if all dependencies in Python have been installed
+try:
+   from pyacvd import clustering
+except:
+   raise ImportError("Please install pyacvd (sudo pip3 install pyacvd)")
+try:
+   from pymeshfix import _meshfix
+except:
+   raise ImportError("Please install pymeshfix (sudo pip3 install pymeshfix)")
+try:
+   import pyvista
+except:
+   raise ImportError("Please install pyvista (sudo pip3 install pyvista)")
+
+try:
+   import vtk
+   __has_vtk=True
+except:
+   raise ImportError("Please install vtk (sudo pip3 install vtk)")
+try:
+   #We could easily get away from this, but I've been too lazy to do so.
+   from mpacts.geometrygenerators.meshobjects import TriangleMeshObject
+   __has_mpacts_python3 = True
+except:
+   print("Warning: No Python3-compatible Mpacts found. TriangleMeshObject will not be used and no cavity checks will be performed")
+   __has_mpacts_python3 = False
+
+import os,sys
+import numpy as np
+import argparse
+try:
+    from vtk.util.numpy_support import vtk_to_numpy
+    from vtk.vtkIOPython import vtkSTLReader
+    from vtk.vtkIOPython import vtkOBJReader
+    __vtk_b =True
+except:
+    try:
+        from vtk.vtkIOGeometryPython import vtkSTLReader, vtkOBJReader
+        __vtk_b =True
+    except:
+        try:
+            from vtk import vtkSTLReader, vtkOBJReader
+            __vtk_b =True
+        except:
+            print("WARNING: python vtk interface not available; file-readers not all available!")
+            __vtk_b =False
+
+def __check_file_exists( fname ):
+    if (not os.path.isfile(fname) ) or os.path.getsize(fname) <=0:
+        raise ValueError("file '"+os.path.abspath(fname)+"' does not exist or is empty.")
+
+def read_stl( fname ):
+    """reads in STL files.
+    Uses vtk if available.
+
+    Returns 2 numpy-arrays: the first are the vertices, the second are the triangles.
+    """
+    __check_file_exists( fname )
+    if __vtk_b:
+        #if the vtk toolkit is available use that toolkit
+        return __read_stl_vtk( fname )
+    else:
+        #default to our own implementation
+        from . import stl_reader
+        stl_r = stl_reader.stl_reader()
+        return stl_r.parse(fname, False)
+
+
+def __read_stl_vtk( fname ):
+    reader = vtkSTLReader()
+    reader.SetFileName( fname )
+    reader.Update()
+    polydata = reader.GetOutput()
+    polys = vtk_to_numpy( polydata.GetPolys().GetData() )
+    verts = vtk_to_numpy( polydata.GetPoints().GetData() )
+    N = polys[0]
+    if len(polys)%(N+1)==0:
+        polys = polys.reshape(-1,N+1)
+        if np.all( polys[:,0]==N ):
+            return np.array(verts, dtype=np.float_), polys[:,1:]
+    # I don't think that this would actually be a valid stl-mesh...:
+    poly_l = list()
+    i =0
+    while i < len(polys):
+        num = polys[i]
+        el = []
+        for j in range(i,i+num):
+            el.append(polys[j])
+        poly_l.append( tuple(el) )
+        i+=num
+    return np.array(verts, dtype=np.float_), np.array(poly_l)
+
+def __vtk_insert_next_tuple_M( array, M, components ):
+   if   M==1:
+      array.InsertNextTuple1( components )
+   elif M==2:
+      array.InsertNextTuple2( *components )
+   elif M==3:
+      array.InsertNextTuple3( *components )
+   elif M==4:
+      array.InsertNextTuple4( *components )
+   elif M==9:
+      array.InsertNextTuple9( *components )
+   else:
+      raise ValueError( "Only tuples of 1,2,3,4, or 9 are allowed!" )
+   return array
+
+
+def __make_vtk_polydata( vertices, triangles, **kwargs):
+   Points = vtk.vtkPoints()
+   Triangles = vtk.vtkCellArray()
+
+   for v in vertices:
+      Points.InsertNextPoint( *v )
+
+   for t in triangles:
+      Triangle = vtk.vtkTriangle()
+      Triangle.GetPointIds().SetId(0, t[0])
+      Triangle.GetPointIds().SetId(1, t[1])
+      Triangle.GetPointIds().SetId(2, t[2])
+      Triangles.InsertNextCell(Triangle)
+
+   #make the polygon(s) to be written
+   polydata = vtk.vtkPolyData()
+   polydata.SetPoints(Points)
+   polydata.SetPolys(Triangles)
+
+   for k,v in list(kwargs.items()):
+      s = np.shape( np.array( v ) )
+      if len(s)>1:
+         N = s[0]
+         M = s[1]
+      else:
+         N = s[0]
+         M = 1
+      if k.startswith('point'):
+         assert len(v)==len(vertices), "Point data length != number of vertices!"
+         dname = k[5:]
+         isPoint = True
+      elif k.startswith('cell'):
+         assert len(v)==len(triangles), "Cell data length != number of triangles!"
+         dname = k[4:]
+         isPoint = False
+      else:
+         raise ValueError("kwargs have to start with either 'point' or 'cell', to be able to distinguish the two!")
+      #setup data
+      data = vtk.vtkFloatArray()
+      data.SetNumberOfComponents(M)
+      data.SetName(dname)
+      for p in v:
+         data = __vtk_insert_next_tuple_M( data, M, p )
+      if isPoint:
+         polydata.GetPointData().SetScalars(data)
+      else:
+         polydata.GetCellData().SetScalars(data)
+   polydata.Modified()
+   if vtk.VTK_MAJOR_VERSION <= 5:
+       polydata.Update()
+   return polydata
+
+def save_stl( vertices, triangles, fname, binary=False ):
+   """Saves vertices and triangles as a stereo lithography (stl) file using vtk.
+      You have the choice of (non-portable?) binary and ascii files.
+   """
+   if not __has_vtk:
+      raise ValueError("To write stl files, (python-)vtk is needed!")
+   polydata = __make_vtk_polydata( vertices, triangles )
+   writer = vtk.vtkSTLWriter()
+   if binary:
+       writer.SetFileTypeToBinary()
+   else:
+       writer.SetFileTypeToASCII()
+   writer.SetFileName( fname )
+   if vtk.VTK_MAJOR_VERSION <= 5:
+       writer.SetInput(polydata)
+   else:
+       writer.SetInputData(polydata)
+   writer.Write()
+
+def remesh_file( inputname, outputname, N, verbose, cavity ):
+   ctrl,vil = read_stl(inputname)
+   if verbose:
+      print("Original mesh has {} nodes and {} triangles".format(len(ctrl),len(vil)))
+   _meshfix.clean_from_file(inputname, outputname)
+   stlReader = vtk.vtkSTLReader()
+   stlReader.SetFileName(outputname)
+   stlReader.Update()
+   mesh = stlReader.GetOutput()
+   mesh = pyvista.PolyData(mesh)
+   cobj = clustering.Clustering(mesh)
+   Nsubdivide = int(np.ceil(np.log2( N/float(len(ctrl)) )))
+   if Nsubdivide > 0:
+      cobj.subdivide(Nsubdivide)
+      if verbose:
+         print("Subdiving original mesh {} times".format(Nsubdivide))
+
+   cobj.cluster(N)
+   remesh = cobj.create_mesh()
+   w = vtk.vtkSTLWriter()
+   w.SetFileName(outputname)
+   w.SetInputData(remesh)
+   w.Update()
+   _meshfix.clean_from_file(outputname, outputname)
+   ctrl,vil =read_stl(outputname)
+   if __has_mpacts_python3:
+      mesh = TriangleMeshObject()
+      for xi in ctrl:
+         mesh.add_vertex(tuple(xi))
+      for ti in vil:
+         mesh.add_triangle(tuple([int(el) for el in ti]))
+      if not cavity:
+         if mesh.is_cavity():
+            #Flip for cavity that should not be a cavity
+            vil = [el[::-1] for el in vil]
+      if cavity:
+         if not mesh.is_cavity():
+            #Flip for not cavity that should be a cavity
+            vil = [el[::-1] for el in vil]
+   else:
+      if verbose:
+         print("Skipping cavity checks since Mpacts is lacking.")
+   if verbose:
+      print("Created new mesh with {} nodes and {} triangles".format(len(ctrl),len(vil)))
+   save_stl( ctrl, vil, outputname)
+
+
+if __name__ == '__main__':
+    mainstr = """Quick and easy automatic remesh of stl files using pyacvd remesher.
+              """
+    parser = argparse.ArgumentParser( description = mainstr )
+    parser.add_argument('input', nargs=1, help='Name of stl that must be remeshed')
+    parser.add_argument('output', nargs=1, help='Name of output file. If not given, the input file will be replaced', default=None)
+    parser.add_argument('directories', nargs = '*', help = 'List of directories to perform the analysis in')
+    parser.add_argument( "-v", "--verbose", help="Increase output verbosity", action="store_true")
+    parser.add_argument( "-c", "--cavity", help="If the mesh represents a cavity, set this to true.", action="store_true")
+    parser.add_argument("-n", "--nodes", type=int,help="Number of nodes in output mesh. If not given, a default value of 1000 will be used.", default=1000)
+    ns = parser.parse_args()
+    inputfname = ns.input[0]
+    outputfname = ns.output[0] if ns.output[0] is not None else ns.input[0]
+    N = ns.nodes
+    verbose=ns.verbose
+    remesh_file( inputfname, outputfname, N, ns.verbose, ns.cavity )
+
+
+
